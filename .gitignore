@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
