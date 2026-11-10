@@ -1,37 +1,29 @@
 /*
- * app/main.c — Fade demo: sweep PD12 from off to full brightness.
+ * app/main.c — Fade driven by TIM4 update ISR at 1 kHz.
  *
- * Same PD12 LED as the blinky project, but the toggle loop is gone.
- * The timer hardware now generates the waveform; the application only
- * changes the duty cycle. Note that nothing in the main loop blocks
- * while the LED is fading — the CPU is free the entire time.
+ * The whole fade now lives in the ISR (via the callback), not in the
+ * main loop. main is free to do other work; in this demo it just
+ * prints status changes and spins, but the printing is *reactive* —
+ * it only fires when the ISR has advanced the fade by a step.
  *
- * The demo includes a small self-contained UART console (for progress
- * output), same as the ADC project. It is demo scaffolding, not part
- * of the driver.
- *
- * Wiring:
- *   - LED:     PD12 → resistor → LED → GND (built-in on Discovery)
- *   - Serial:  PA2 (TX) → USB-UART adapter RX, GND → GND, 115200 8N1
+ * Contrast with the previous PWM demo: that one had a busy-wait
+ * `delay_()` that blocked the CPU between every duty change. Here
+ * main never blocks, never calls a delay, and never sets the duty
+ * directly — it just observes.
  */
 #include "stm32f407_regs.h"
 #include "pwm.h"
 
-/* ============= Demo-only console (identical to ADC project) ============= */
+/* ============= Demo console (unchanged from prior projects) ======== */
 
 static void console_init(void) {
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;   /* placeholder, no-op for GPIOA */
-    /* The console uses PA2/PA3. We add the GPIOA enable the cheap way
-     * to keep the diff small — see the ADC project for the full version. */
-    RCC->AHB1ENR |= (1U << 0);             /* GPIOAEN */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
 
-    volatile uint32_t *gpioa_moder = (volatile uint32_t *)0x40020000UL;
-    volatile uint32_t *gpioa_afr0  = (volatile uint32_t *)0x40020020UL;
-    *gpioa_moder &= ~((3U << 4) | (3U << 6));
-    *gpioa_moder |=  ((2U << 4) | (2U << 6));
-    *gpioa_afr0 &= ~((0xFU << 8) | (0xFU << 12));
-    *gpioa_afr0 |=  ((0x7U << 8) | (0x7U << 12));
+    GPIOA->MODER &= ~((3U << 4) | (3U << 6));
+    GPIOA->MODER |=  ((2U << 4) | (2U << 6));
+    GPIOA->AFR[0] &= ~((0xFU << 8) | (0xFU << 12));
+    GPIOA->AFR[0] |=  ((0x7U << 8) | (0x7U << 12));
 
     USART2->BRR = (16000000UL + 115200U / 2) / 115200U;
     USART2->CR1 = USART_CR1_TE | USART_CR1_UE;
@@ -41,7 +33,6 @@ static void putc_(char c) {
     while (!(USART2->SR & USART_SR_TXE)) { }
     USART2->DR = (uint8_t)c;
 }
-
 static void puts_(const char *s) { while (*s) putc_(*s++); }
 
 static void print_u32(uint32_t v) {
@@ -52,38 +43,87 @@ static void print_u32(uint32_t v) {
     while (i--) putc_(buf[i]);
 }
 
-static void delay_(volatile uint32_t n) { while (n--) __asm__("nop"); }
+/* ============= Fade state, shared with the ISR ======================
+ *
+ * Every variable the ISR writes and main reads must be `volatile`.
+ * Without it, the compiler is allowed to cache the value in a
+ * register and never reload from memory — main would see the initial
+ * value forever while the ISR happily updated it in memory.
+ *
+ * On a 32-bit CPU, reads and writes of uint8_t/int8_t are atomic, so
+ * no critical sections are needed for single-byte access. If you
+ * added a multi-word shared struct, you'd need to disable interrupts
+ * briefly around the read (or use a seqlock). */
+
+/* How many update events between fade steps. At 1 kHz, 40 events =
+ * 40 ms per step, so a full 0→100 sweep takes ~4 seconds. */
+#define TICKS_PER_STEP  40
+
+static volatile uint8_t  s_duty_pct     = 0;
+static volatile int8_t   s_direction    = 1;   /* +1 up, -1 down */
+static volatile uint16_t s_tick_counter = 0;
+static volatile uint32_t s_step_count   = 0;   /* increments on each fade step */
+
+/*
+ * fade_step — called from TIM4_IRQHandler at 1 kHz.
+ *
+ * Runs *inside interrupt context*. Must be fast: no serial, no
+ * busy-waits, no long loops. The body here is under a dozen
+ * instructions — that's the right budget for an ISR callback.
+ *
+ * Uses pwm_set_duty rather than pwm_set_raw so the fade is expressed
+ * in whole percent. The preload bit (OC1PE) means the CCR1 write
+ * takes effect at the next update event — no glitch even though we're
+ * modifying the register mid-period.
+ */
+static void fade_step(void) {
+    s_tick_counter++;
+    if (s_tick_counter < TICKS_PER_STEP) return;
+    s_tick_counter = 0;
+
+    int16_t next = (int16_t)s_duty_pct + s_direction;
+    if (next >= 100) { next = 100; s_direction = -1; }
+    if (next <= 0)   { next = 0;   s_direction = 1; }
+
+    s_duty_pct = (uint8_t)next;
+    pwm_set_duty(s_duty_pct);
+    s_step_count++;
+}
 
 /* ============================ Main ============================ */
 
 int main(void) {
     console_init();
-    if (pwm_init(1000) != 0) {                 /* 1 kHz */
-        puts_("pwm_init failed: frequency not reachable\r\n");
+
+    if (pwm_init(1000) != 0) {                  /* 1 kHz PWM */
+        puts_("pwm_init failed\r\n");
         while (1) { }
     }
 
-    puts_("\r\n=== TIM4 PWM on PD12 — 1 kHz ===\r\n");
-    puts_("Period: ");
-    print_u32(pwm_get_period() + 1);
-    puts_(" counts\r\n\r\n");
+    puts_("\r\n=== TIM4 update interrupt demo ===\r\n");
+    puts_("Fade is driven by the ISR at 1 kHz.\r\n");
+    puts_("main does nothing but react.\r\n\r\n");
 
+    pwm_enable_update_irq(fade_step);
+
+    /* main loop: purely reactive. It prints when s_step_count changes,
+     * and does "other work" in between. Nothing here drives the fade —
+     * the ISR does. Main is completely decoupled from the timing. */
+    uint32_t last_step = 0;
+    uint32_t main_work = 0;
     while (1) {
-        /* Fade up */
-        for (uint8_t d = 0; d <= 100; d += 5) {
-            pwm_set_duty(d);
+        uint32_t current = s_step_count;
+        if (current != last_step) {
+            last_step = current;
             puts_("duty = ");
-            print_u32(d);
-            puts_("%\r\n");
-            delay_(600000);
+            print_u32(s_duty_pct);
+            puts_("%   updates = ");
+            print_u32(pwm_get_update_count());
+            puts_("   main_work = ");
+            print_u32(main_work);
+            puts_("\r\n");
+            main_work = 0;   /* reset per print so you can see progress */
         }
-        /* Fade down */
-        for (int d = 100; d >= 0; d -= 5) {
-            pwm_set_duty((uint8_t)d);
-            puts_("duty = ");
-            print_u32((uint32_t)d);
-            puts_("%\r\n");
-            delay_(600000);
-        }
+        main_work++;
     }
 }

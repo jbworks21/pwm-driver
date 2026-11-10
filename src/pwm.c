@@ -132,3 +132,79 @@ void pwm_set_raw(uint16_t value) {
 uint16_t pwm_get_period(void) {
     return s_period;
 }
+
+/* ================================================================
+ * Timer interrupt support.
+ *
+ * The chain that makes an ISR actually fire:
+ *
+ *   TIM4->DIER.UIE = 1     ← timer raises the IRQ line on update
+ *   NVIC->ISER[0].30 = 1   ← NVIC forwards IRQ 30 to the CPU
+ *   vector[46] = TIM4_IRQHandler  ← CPU jumps to our ISR
+ *   ISR clears TIM4->SR.UIF ← stop the re-entry
+ *
+ * Any one of those missing and nothing happens. Debugging a "my
+ * interrupt doesn't fire" problem is almost always a hunt for
+ * which of the four steps was skipped.
+ * ================================================================ */
+
+static volatile pwm_update_cb_t s_callback    = 0;
+static volatile uint32_t        s_update_count = 0;
+
+void pwm_enable_update_irq(pwm_update_cb_t cb) {
+    s_callback     = cb;
+    s_update_count = 0;
+
+    /* Clear any stale UIF before enabling. If the flag was set by an
+     * earlier update (which it will be, since the timer has been
+     * running), the ISR would fire the instant NVIC enable lands —
+     * before the callback is installed. Belt-and-braces. */
+    PWM_TIM->SR = ~TIM_SR_UIF;
+
+    /* Step 1: peripheral-side enable. */
+    PWM_TIM->DIER |= TIM_DIER_UIE;
+
+    /* Step 2: NVIC-side enable. This is the step SysTick skipped. */
+    NVIC_ISER0 = (1U << TIM4_IRQN);
+}
+
+void pwm_disable_update_irq(void) {
+    NVIC_ICER0 = (1U << TIM4_IRQN);
+    PWM_TIM->DIER &= ~TIM_DIER_UIE;
+    s_callback = 0;
+}
+
+uint32_t pwm_get_update_count(void) {
+    return s_update_count;
+}
+
+/*
+ * TIM4_IRQHandler — the ISR that fires on every PWM update event.
+ *
+ * `startup.c` declares this as a weak alias to Default_Handler, so
+ * the vector table has a valid pointer before this file is linked.
+ * This strong definition overrides the alias at link time, and the
+ * vector table's slot 46 automatically points here. That's the whole
+ * trick of the weak-alias pattern: no manual editing of the vector
+ * table when you add an ISR.
+ *
+ * Note the ISR is *four instructions* of actual work. This is not an
+ * accident — the shorter the ISR, the less it delays other interrupts
+ * and the main loop. Heavy work belongs in the callback, or better,
+ * outside interrupt context entirely.
+ */
+void TIM4_IRQHandler(void) {
+    /* Clear UIF. The `= ~TIM_SR_UIF` idiom writes 0 to bit 0 (clears
+     * it) and 1 to all other bits (which are rc_w0, so writing 1 is a
+     * no-op — they keep their current state). This is the standard
+     * STM32 way to clear a single flag without a read-modify-write
+     * race. */
+    PWM_TIM->SR = ~TIM_SR_UIF;
+
+    s_update_count++;
+
+    /* Tail-call to the registered callback. Null check in case the
+     * timer still has a pending IRQ after pwm_disable_update_irq
+     * cleared s_callback but before ICER took effect. */
+    if (s_callback) s_callback();
+}

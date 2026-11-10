@@ -47,3 +47,36 @@ void pwm_set_raw(uint16_t value);
 uint16_t pwm_get_period(void);
 
 #endif /* PWM_H */
+
+/* ================================================================
+ * Timer interrupt API (added in this project).
+ * ================================================================ */
+
+/*
+ * Callback signature for the update interrupt.
+ *
+ * The driver owns TIM4_IRQHandler (it's defined in pwm.c). The ISR
+ * does the minimum possible work — clear UIF, call this callback —
+ * and your code runs inside the callback, still in interrupt context.
+ *
+ * The callback runs at the PWM update frequency (1 kHz by default),
+ * so it must be *fast*. No blocking, no serial printing, no long
+ * loops. The whole point of this pattern is that the ISR stays tiny.
+ */
+typedef void (*pwm_update_cb_t)(void);
+
+/*
+ * Enable the update interrupt. Sets DIER.UIE in TIM4 and enables
+ * IRQ 30 in the NVIC. The callback fires on every update event.
+ *
+ * Calling this again replaces the previous callback.
+ */
+void pwm_enable_update_irq(pwm_update_cb_t cb);
+
+/* Disable both the peripheral source and the NVIC enable. */
+void pwm_disable_update_irq(void);
+
+/* Returns the number of update events that have fired since the last
+ * call to pwm_enable_update_irq. Useful for verification: at 1 kHz,
+ * this should advance ~1000 per second. */
+uint32_t pwm_get_update_count(void);
